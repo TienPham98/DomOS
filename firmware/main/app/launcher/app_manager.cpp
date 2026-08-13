@@ -538,10 +538,18 @@ static std::string s_active_wallpaper_name;
 static bool s_slideshow_active = false;
 static int s_slideshow_interval_sec = 30;
 static int s_current_slot_idx = 0;
-static const char *s_slot_filepaths[3] = {
-    "/littlefs/wallpapers/current.jpg",
-    "/littlefs/wallpapers/next.jpg",
-    "/littlefs/wallpapers/next2.jpg"
+constexpr size_t NUM_WALLPAPER_SLOTS = 10;
+static const char *s_slot_filepaths[NUM_WALLPAPER_SLOTS] = {
+    "/littlefs/wallpapers/wp_0.jpg",
+    "/littlefs/wallpapers/wp_1.jpg",
+    "/littlefs/wallpapers/wp_2.jpg",
+    "/littlefs/wallpapers/wp_3.jpg",
+    "/littlefs/wallpapers/wp_4.jpg",
+    "/littlefs/wallpapers/wp_5.jpg",
+    "/littlefs/wallpapers/wp_6.jpg",
+    "/littlefs/wallpapers/wp_7.jpg",
+    "/littlefs/wallpapers/wp_8.jpg",
+    "/littlefs/wallpapers/wp_9.jpg"
 };
 static std::vector<std::string> s_playlist_urls;
 static size_t s_playlist_idx = 0;
@@ -1444,6 +1452,7 @@ void AppManager::SetWallpaperUrl(const std::string &url, const std::string &name
     if (!name.empty()) s_active_wallpaper_name = name;
     AddSystemLog("INFO", "wallpaper", "Active wallpaper set to: %s (%s)", s_active_wallpaper_name.c_str(), s_active_wallpaper_url.c_str());
     if (!url.empty()) {
+        s_current_slot_idx = (s_current_slot_idx + 1) % NUM_WALLPAPER_SLOTS;
         const char *current_path = s_slot_filepaths[s_current_slot_idx];
         DownloadUrlToFile(url, current_path);
         if (current_ != nullptr && std::string(current_->Id()) == "wallpaper") {
@@ -1494,38 +1503,30 @@ int AppManager::GetSlideshowInterval() const
 
 void AppManager::TriggerNextSlide()
 {
-    s_current_slot_idx = (s_current_slot_idx + 1) % 3;
+    s_current_slot_idx = (s_current_slot_idx + 1) % NUM_WALLPAPER_SLOTS;
     const char *current_path = s_slot_filepaths[s_current_slot_idx];
     if (board_ != nullptr) {
         StreamDecodeJpegFileToPanel(current_path, board_);
     }
 
-    int next_slot = (s_current_slot_idx + 1) % 3;
-    int next2_slot = (s_current_slot_idx + 2) % 3;
     if (!s_playlist_urls.empty()) {
         s_playlist_idx = (s_playlist_idx + 1) % s_playlist_urls.size();
+        int next_slot = (s_current_slot_idx + 1) % NUM_WALLPAPER_SLOTS;
         DownloadUrlToFile(s_playlist_urls[s_playlist_idx], s_slot_filepaths[next_slot]);
-        size_t next2_idx = (s_playlist_idx + 1) % s_playlist_urls.size();
-        DownloadUrlToFile(s_playlist_urls[next2_idx], s_slot_filepaths[next2_slot]);
     }
 }
 
 void AppManager::TriggerPrevSlide()
 {
-    s_current_slot_idx = (s_current_slot_idx + 2) % 3;
+    s_current_slot_idx = (s_current_slot_idx + NUM_WALLPAPER_SLOTS - 1) % NUM_WALLPAPER_SLOTS;
     const char *current_path = s_slot_filepaths[s_current_slot_idx];
     if (board_ != nullptr) {
         StreamDecodeJpegFileToPanel(current_path, board_);
     }
 
-    int next_slot = (s_current_slot_idx + 1) % 3;
-    int next2_slot = (s_current_slot_idx + 2) % 3;
     if (!s_playlist_urls.empty()) {
         s_playlist_idx = (s_playlist_idx + s_playlist_urls.size() - 1) % s_playlist_urls.size();
-        DownloadUrlToFile(s_playlist_urls[s_playlist_idx], s_slot_filepaths[next_slot]);
-        size_t next2_idx = (s_playlist_idx + 1) % s_playlist_urls.size();
-        DownloadUrlToFile(s_playlist_urls[next2_idx], s_slot_filepaths[next2_slot]);
+        int prev_slot = (s_current_slot_idx + NUM_WALLPAPER_SLOTS - 1) % NUM_WALLPAPER_SLOTS;
+        DownloadUrlToFile(s_playlist_urls[s_playlist_idx], s_slot_filepaths[prev_slot]);
     }
 }
-
-

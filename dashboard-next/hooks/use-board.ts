@@ -34,7 +34,7 @@ export function useBoard(overrideIp?: string) {
   const [error, setError] = useState<string | null>(null);
   const [telemetry, setTelemetry] = useState<Array<{ time: string; rssi: number; heap: number; temp: number }>>([]);
 
-  const targetIp = overrideIp || (typeof window !== "undefined" ? localStorage.getItem("domos_device_ip") || "192.168.0.106" : "192.168.0.106");
+  const targetIp = overrideIp || (typeof window !== "undefined" ? localStorage.getItem("domos_device_ip") || process.env.NEXT_PUBLIC_DEVICE_IP || "192.168.0.106" : process.env.NEXT_PUBLIC_DEVICE_IP || "192.168.0.106");
 
 
   useEffect(() => {

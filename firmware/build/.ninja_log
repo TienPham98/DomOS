@@ -1549,3 +1549,32 @@
 95	228	8080727594760783	D:/Work space/DomOS/firmware/build/bootloader/bootloader.map	279ee0f93324640c
 228	15590	0	CMakeFiles/flash	83bbfbb9ace0b435
 228	15590	0	D:/Work space/DomOS/firmware/build/CMakeFiles/flash	83bbfbb9ace0b435
+77	206	8080727594760783	bootloader-prefix/src/bootloader-stamp/bootloader-build	279ee0f93324640c
+77	206	8080727594760783	bootloader/bootloader.elf	279ee0f93324640c
+77	206	8080727594760783	bootloader/bootloader.bin	279ee0f93324640c
+77	206	8080727594760783	bootloader/bootloader.map	279ee0f93324640c
+77	206	8080727594760783	D:/Work space/DomOS/firmware/build/bootloader-prefix/src/bootloader-stamp/bootloader-build	279ee0f93324640c
+77	206	8080727594760783	D:/Work space/DomOS/firmware/build/bootloader/bootloader.elf	279ee0f93324640c
+77	206	8080727594760783	D:/Work space/DomOS/firmware/build/bootloader/bootloader.bin	279ee0f93324640c
+77	206	8080727594760783	D:/Work space/DomOS/firmware/build/bootloader/bootloader.map	279ee0f93324640c
+85	1115	8083459229183373	esp-idf/main/CMakeFiles/__idf_main.dir/app/launcher/app_manager.cpp.obj	c1f51864c61699ae
+1116	1231	8083459230396612	esp-idf/main/libmain.a	4d5a0c5e2e21bc6a
+1231	7202	8083459289892215	esp-idf/esp_system/ld/sections.ld	25eb8a2cf17986d2
+1231	7202	8083459289892215	D:/Work space/DomOS/firmware/build/esp-idf/esp_system/ld/sections.ld	25eb8a2cf17986d2
+7202	13100	8083459348729502	domos_firmware.elf	418fc34ccbcbd32f
+13100	13364	8083459351726676	.bin_timestamp	22af013e997fcae2
+13100	13364	8083459351726676	D:/Work space/DomOS/firmware/build/.bin_timestamp	22af013e997fcae2
+13364	13438	0	esp-idf/esptool_py/CMakeFiles/app_check_size	89b42beafbd8107c
+13364	13438	0	D:/Work space/DomOS/firmware/build/esp-idf/esptool_py/CMakeFiles/app_check_size	89b42beafbd8107c
+100	177	0	esp-idf/esptool_py/CMakeFiles/app_check_size	89b42beafbd8107c
+100	177	0	D:/Work space/DomOS/firmware/build/esp-idf/esptool_py/CMakeFiles/app_check_size	89b42beafbd8107c
+94	224	8080727594760783	bootloader-prefix/src/bootloader-stamp/bootloader-build	279ee0f93324640c
+94	224	8080727594760783	bootloader/bootloader.elf	279ee0f93324640c
+94	224	8080727594760783	bootloader/bootloader.bin	279ee0f93324640c
+94	224	8080727594760783	bootloader/bootloader.map	279ee0f93324640c
+94	224	8080727594760783	D:/Work space/DomOS/firmware/build/bootloader-prefix/src/bootloader-stamp/bootloader-build	279ee0f93324640c
+94	224	8080727594760783	D:/Work space/DomOS/firmware/build/bootloader/bootloader.elf	279ee0f93324640c
+94	224	8080727594760783	D:/Work space/DomOS/firmware/build/bootloader/bootloader.bin	279ee0f93324640c
+94	224	8080727594760783	D:/Work space/DomOS/firmware/build/bootloader/bootloader.map	279ee0f93324640c
+225	15574	0	CMakeFiles/flash	83bbfbb9ace0b435
+225	15574	0	D:/Work space/DomOS/firmware/build/CMakeFiles/flash	83bbfbb9ace0b435
