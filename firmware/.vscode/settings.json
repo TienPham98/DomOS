@@ -1,0 +1,11 @@
+{
+    "idf.espIdfPath": "C:\\Espressif\\frameworks\\esp-idf-v5.3.1",
+    "idf.pythonBinPath": "C:\\Espressif\\python_env\\idf5.3_py3.11_env\\Scripts\\python.exe",
+    "idf.toolsPath": "C:\\Espressif",
+    "idf.customExtraPaths": "C:\\Espressif\\tools\\xtensa-esp-elf\\esp-13.2.0_20240530\\xtensa-esp-elf\\bin;C:\\Espressif\\tools\\riscv32-esp-elf\\esp-13.2.0_20240305\\riscv32-esp-elf\\bin;C:\\Espressif\\tools\\esp32ulp-elf\\2.38_20240113\\esp32ulp-elf\\bin;C:\\Espressif\\tools\\cmake\\3.24.0\\bin;C:\\Espressif\\tools\\openocd-esp32\\v0.12.0-esp32-20240318\\openocd-esp32\\bin;C:\\Espressif\\tools\\ninja\\1.11.1",
+    "idf.customExtraVars": {
+        "IDF_TARGET": "esp32s3"
+    },
+    "idf.port": "COM5",
+    "idf.flashType": "UART"
+}

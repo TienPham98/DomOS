@@ -1,0 +1,2 @@
+ninja: error: remove(esp-idf\lvgl__lvgl\CMakeFiles\__idf_lvgl__lvgl.dir\src\draw\stm32_dma2d\lv_gpu_stm32_dma2d.c.obj.d): The process cannot access the file because it is being used by another process.
+

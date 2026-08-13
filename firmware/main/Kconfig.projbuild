@@ -1,0 +1,32 @@
+menu "DomOS"
+
+config DOMOS_WIFI_SSID
+    string "Wi-Fi SSID"
+    default ""
+    help
+        Wi-Fi network name. Set this with idf.py menuconfig before flashing.
+
+config DOMOS_WIFI_PASSWORD
+    string "Wi-Fi password"
+    default ""
+    help
+        WPA2 password. This value is compiled into the development firmware.
+
+config DOMOS_WIFI_MAX_RETRY
+    int "Wi-Fi reconnect attempts"
+    default 10
+    range 1 100
+
+config DOMOS_MQTT_URI
+    string "MQTT broker URI"
+    default ""
+    help
+        For example mqtt://192.168.1.10:1883. MQTT stays disabled when empty.
+
+config DOMOS_OTA_FIRMWARE_URL
+    string "HTTPS firmware URL"
+    default ""
+    help
+        Complete HTTPS URL for the signed firmware image. OTA stays disabled when empty.
+
+endmenu

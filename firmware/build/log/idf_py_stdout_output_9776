@@ -1,0 +1,14 @@
+-- git rev-parse returned 'fatal: not a git repository (or any of the parent directories): .git'
+-- Could not use 'git describe' to determine PROJECT_VER.
+-- Building ESP-IDF components for target esp32s3
+NOTICE: Processing 5 dependencies:
+NOTICE: [1/5] espressif/cmake_utilities (0.5.3)
+NOTICE: [2/5] espressif/esp_lcd_ili9341 (2.0.2)
+NOTICE: [3/5] joltwallet/littlefs (1.22.3)
+NOTICE: [4/5] lvgl/lvgl (8.4.0)
+NOTICE: [5/5] idf (5.3.1)
+-- Configuring incomplete, errors occurred!
+See also "D:/Work space/DomOS/firmware/build/CMakeFiles/CMakeOutput.log".
+[0/1] Re-running CMake...
+FAILED: build.ninja 
+C:\Espressif\tools\cmake\3.24.0\bin\cmake.exe --regenerate-during-build -S"D:\Work space\DomOS\firmware" -B"D:\Work space\DomOS\firmware\build"
