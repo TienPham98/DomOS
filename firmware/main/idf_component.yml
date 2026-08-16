@@ -1,0 +1,8 @@
+dependencies:
+  idf: ">=5.3"
+  espressif/esp_lcd_ili9341: "^2.0.2"
+  joltwallet/littlefs: "^1.22.1"
+  lvgl/lvgl: "8.4.0"
+  espressif/esp_websocket_client: ">=1.1.0"
+  # Match the proven ES8311 control/data layer used by xiaozhi-esp32.
+  espressif/esp_codec_dev: "==1.5.6"

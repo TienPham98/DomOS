@@ -1,0 +1,753 @@
+"""Dom Voice Protocol v3 using OpenRouter cloud AI and Edge cloud TTS."""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import contextlib
+import io
+import json
+import logging
+import math
+import re
+import time
+import unicodedata
+import uuid
+import wave
+from array import array
+from collections import deque
+from dataclasses import dataclass, field
+from typing import Any
+
+import av
+import edge_tts
+import httpx
+import speech_recognition as sr
+from fastapi import WebSocket, WebSocketDisconnect
+from gtts import gTTS
+
+from config import settings
+from services.conversation_store import ConversationStore
+
+logger = logging.getLogger("domos.openrouter")
+
+PCM_SAMPLE_RATE = 16_000
+PCM_CHANNELS = 1
+PCM_SAMPLE_WIDTH = 2
+PCM_FRAME_MS = 60
+PCM_FRAME_BYTES = PCM_SAMPLE_RATE * PCM_FRAME_MS // 1000 * PCM_SAMPLE_WIDTH
+VAD_ENERGY_THRESHOLD = 180
+VAD_SILENCE_FRAMES = 9
+VAD_MIN_SPEECH_FRAMES = 3
+VAD_MAX_FRAMES = 20_000 // PCM_FRAME_MS
+WAKE_MAX_FRAMES = 3_000 // PCM_FRAME_MS
+
+SYSTEM_PROMPT = """Bạn là Dom, trợ lý giọng nói tiếng Việt của DomOS trên thiết bị ESP32-S3.
+Luôn hiểu và trả lời bằng tiếng Việt tự nhiên, ngắn gọn, thân thiện, phù hợp để đọc thành tiếng.
+Bạn có thể điều khiển thiết bị bằng các công cụ được cung cấp. Khi người dùng yêu cầu điều khiển,
+phải gọi công cụ phù hợp và chỉ xác nhận thành công sau khi nhận kết quả công cụ. Không bịa kết quả.
+Với lệnh tăng/giảm không nêu mức, dùng delta 10 hoặc -10. Chỉ trả lời nội dung cần nói, không Markdown."""
+
+TOOLS = [
+    {"type": "function", "function": {"name": "device.get_status", "description": "Lấy trạng thái trợ lý và âm thanh", "parameters": {"type": "object", "properties": {}, "additionalProperties": False}}},
+    {"type": "function", "function": {"name": "speaker.set_volume", "description": "Đặt âm lượng loa từ 0 đến 100", "parameters": {"type": "object", "properties": {"volume": {"type": "integer", "minimum": 0, "maximum": 100}}, "required": ["volume"], "additionalProperties": False}}},
+    {"type": "function", "function": {"name": "speaker.adjust_volume", "description": "Tăng hoặc giảm âm lượng loa theo delta", "parameters": {"type": "object", "properties": {"delta": {"type": "integer", "minimum": -100, "maximum": 100}}, "required": ["delta"], "additionalProperties": False}}},
+    {"type": "function", "function": {"name": "display.adjust_brightness", "description": "Tăng hoặc giảm độ sáng màn hình theo delta", "parameters": {"type": "object", "properties": {"delta": {"type": "integer", "minimum": -100, "maximum": 100}}, "required": ["delta"], "additionalProperties": False}}},
+    {"type": "function", "function": {"name": "app.launch", "description": "Mở ứng dụng DomOS", "parameters": {"type": "object", "properties": {"app": {"type": "string", "enum": ["wallpaper", "clock"]}}, "required": ["app"], "additionalProperties": False}}},
+]
+
+
+@dataclass
+class VoiceRegistry:
+    sessions: set[str] = field(default_factory=set)
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+    @property
+    def count(self) -> int:
+        return len(self.sessions)
+
+    async def add(self, session_id: str) -> None:
+        async with self.lock:
+            self.sessions.add(session_id)
+
+    async def remove(self, session_id: str) -> None:
+        async with self.lock:
+            self.sessions.discard(session_id)
+
+
+voice_registry = VoiceRegistry()
+conversation_store = ConversationStore(settings.CONVERSATION_DB_PATH)
+
+
+def validate_dom_hello(message: dict[str, Any]) -> None:
+    expected = {"codec": "pcm", "sample_rate": 16_000, "channels": 1, "frame_duration": 60}
+    audio = message.get("audio_params")
+    if message.get("type") != "hello" or message.get("version") != 3:
+        raise ValueError("Expected Dom Voice Protocol v3 hello")
+    if not isinstance(audio, dict) or any(audio.get(key) != value for key, value in expected.items()):
+        raise ValueError("Unsupported Dom PCM audio parameters")
+
+
+def pcm_rms(pcm: bytes) -> int:
+    samples = array("h")
+    samples.frombytes(pcm[: len(pcm) - len(pcm) % 2])
+    if not samples:
+        return 0
+    return int(math.sqrt(sum(sample * sample for sample in samples) / len(samples)))
+
+
+def pcm_to_wav(pcm: bytes) -> bytes:
+    output = io.BytesIO()
+    with wave.open(output, "wb") as wav:
+        wav.setnchannels(PCM_CHANNELS)
+        wav.setsampwidth(PCM_SAMPLE_WIDTH)
+        wav.setframerate(PCM_SAMPLE_RATE)
+        wav.writeframes(pcm)
+    return output.getvalue()
+
+
+def normalize_wake_pcm(pcm: bytes, target_peak: int = 12_000) -> bytes:
+    """Raise quiet, short wake phrases to a useful STT level without clipping."""
+    samples = array("h")
+    samples.frombytes(pcm[: len(pcm) - len(pcm) % 2])
+    if not samples:
+        return pcm
+    peak = max(abs(sample) for sample in samples)
+    if peak == 0:
+        return pcm
+    gain = min(12.0, max(1.0, target_peak / peak))
+    if gain > 1.0:
+        samples = array("h", (
+            max(-32_768, min(32_767, round(sample * gain))) for sample in samples
+        ))
+    padding = bytes(PCM_SAMPLE_RATE * PCM_SAMPLE_WIDTH // 4)  # 250 ms
+    return padding + samples.tobytes() + padding
+
+
+def _clean_text(value: Any) -> str:
+    if isinstance(value, list):
+        value = " ".join(str(part.get("text", "")) for part in value if isinstance(part, dict))
+    text = str(value or "")
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r"^(bản ghi|transcript|transcription)\s*:\s*", "", text.strip(), flags=re.IGNORECASE)
+    return text.strip().strip('"“”')
+
+
+def _wake_signature_text(text: str) -> str:
+    value = unicodedata.normalize("NFKD", text.casefold())
+    value = "".join(char for char in value if not unicodedata.combining(char))
+    value = value.replace("đ", "d")
+    return re.sub(r"[^a-z0-9]+", " ", value).strip()
+
+
+def matches_device_wake_signature(english: str, vietnamese: str) -> bool:
+    """Require a known result from both recognizers for device-specific misses."""
+    en = _wake_signature_text(english)
+    vi = _wake_signature_text(vietnamese)
+    english_variants = {"i don t", "hey don t", "are you done", "how you doing"}
+    vietnamese_variants = {
+        "hanh dong", "hinh dong", "hinh tron", "thay tro", "thay chon",
+        "thay tung", "thay tran", "thay chua", "hay chon", "thay doi",
+        "cay thong", "cay trong", "het roi", "hey yo", "he does",
+    }
+    return en in english_variants and vi in vietnamese_variants
+
+
+def split_wake_word(text: str) -> tuple[bool, str]:
+    normalized_chars: list[str] = []
+    original_end_offsets: list[int] = []
+    for index, original in enumerate(text.casefold()):
+        decomposed = unicodedata.normalize("NFKD", original)
+        for char in decomposed:
+            if not unicodedata.combining(char):
+                normalized_chars.append("d" if char == "đ" else char)
+                original_end_offsets.append(index + 1)
+    normalized = "".join(normalized_chars)
+    # Cloud STT often maps the short brand phrase to nearby English words
+    # (for example "Hello" or "Hey Don"). Keep fallbacks prefix-only so
+    # ordinary sentences mentioning Dom later do not activate the assistant.
+    patterns = (
+        r"^\s*(?:hey|he|hay|hai|hei)\s+(?:dom|dome|don|dong|down|dam|tom|dog|does|do|to)(?!['’][a-z])\b",
+        r"^\s*(?:hello|helo|halo)(?:\s+(?:dom|dome|don|dong|down|dam|tom))?\b",
+        r"^\s*(?:huy|hui)\s+(?:dong|dom)\b",
+        r"^\s*(?:dom|dome|don|dong)\b",
+    )
+    match = next((candidate for pattern in patterns
+                  if (candidate := re.search(pattern, normalized))), None)
+    if not match:
+        return False, ""
+    original_end = original_end_offsets[match.end() - 1]
+    remainder = text[original_end:].lstrip(" ,.!?:;-–—")
+    return True, remainder
+
+
+class VoiceSession:
+    def __init__(self, websocket: WebSocket, device_id: str, session_id: str) -> None:
+        self.websocket = websocket
+        self.device_id = device_id
+        self.session_id = session_id
+        self.state = "IDLE"
+        self.send_lock = asyncio.Lock()
+        self.pre_roll: deque[bytes] = deque(maxlen=3)
+        self.audio = bytearray()
+        self.speech_frames = 0
+        self.silence_frames = 0
+        self.silence_window: deque[bool] = deque(maxlen=12)
+        self.speech_started = False
+        self.speech_started_at = 0.0
+        self.max_energy = 0
+        self.speech_energy_total = 0
+        self.pipeline_task: asyncio.Task[None] | None = None
+        self.activation_timeout_task: asyncio.Task[None] | None = None
+        self.pending_mcp: dict[int, asyncio.Future[dict[str, Any]]] = {}
+        self.next_request_id = 1
+
+    async def send_json(self, message: dict[str, Any]) -> None:
+        message.setdefault("session_id", self.session_id)
+        async with self.send_lock:
+            await self.websocket.send_text(json.dumps(message, ensure_ascii=False))
+
+    async def send_bytes(self, data: bytes) -> None:
+        async with self.send_lock:
+            await self.websocket.send_bytes(data)
+
+    def reset_capture(self) -> None:
+        self.pre_roll.clear()
+        self.audio.clear()
+        self.speech_frames = 0
+        self.silence_frames = 0
+        self.silence_window.clear()
+        self.speech_started = False
+        self.speech_started_at = 0.0
+        self.max_energy = 0
+        self.speech_energy_total = 0
+
+    async def set_wake_word(self, notify_board: bool = False) -> None:
+        current = asyncio.current_task()
+        if self.activation_timeout_task and self.activation_timeout_task is not current:
+            self.activation_timeout_task.cancel()
+        self.activation_timeout_task = None
+        self.state = "WAKE_WORD"
+        self.reset_capture()
+        if notify_board:
+            await self.send_json({"type": "listen", "state": "wake"})
+        await self.send_json({"type": "llm", "emotion": "idle", "text": ""})
+
+    async def set_listening(self, notify_board: bool = False) -> None:
+        if self.activation_timeout_task:
+            self.activation_timeout_task.cancel()
+        self.state = "LISTENING"
+        self.reset_capture()
+        if notify_board:
+            await self.send_json({"type": "listen", "state": "start"})
+        await self.send_json({"type": "llm", "emotion": "listening", "text": "Mình đang nghe đây..."})
+        self.activation_timeout_task = asyncio.create_task(
+            self.expire_activation(), name=f"wake-timeout-{self.session_id}"
+        )
+
+    async def expire_activation(self) -> None:
+        try:
+            await asyncio.sleep(settings.VOICE_SESSION_TIMEOUT_SEC)
+            if self.state == "LISTENING":
+                logger.info("Listening activation expired device=%s", self.device_id)
+                await self.set_wake_word(notify_board=True)
+        except asyncio.CancelledError:
+            pass
+
+    async def consume_audio(self, pcm: bytes) -> None:
+        if self.state not in {"WAKE_WORD", "LISTENING"} or self.pipeline_task is not None:
+            return
+        energy = pcm_rms(pcm)
+        self.max_energy = max(self.max_energy, energy)
+        if not self.speech_started:
+            self.pre_roll.append(pcm)
+            if energy < VAD_ENERGY_THRESHOLD:
+                return
+            self.speech_started = True
+            self.speech_started_at = time.monotonic()
+            self.audio.extend(b"".join(self.pre_roll))
+            self.speech_frames = 1
+            self.speech_energy_total = energy
+            self.silence_frames = 0
+            return
+        self.audio.extend(pcm)
+        if energy >= VAD_ENERGY_THRESHOLD:
+            self.speech_frames += 1
+            self.speech_energy_total += energy
+            self.silence_frames = 0
+            self.silence_window.append(False)
+        else:
+            self.silence_frames += 1
+            self.silence_window.append(True)
+        frame_limit = WAKE_MAX_FRAMES if self.state == "WAKE_WORD" else VAD_MAX_FRAMES
+        elapsed_limit = frame_limit * PCM_FRAME_MS / 1000
+        enough_recent_silence = (
+            len(self.silence_window) >= VAD_SILENCE_FRAMES
+            and sum(self.silence_window) >= VAD_SILENCE_FRAMES
+        )
+        reached_hard_limit = (
+            len(self.audio) >= frame_limit * PCM_FRAME_BYTES
+            or time.monotonic() - self.speech_started_at >= elapsed_limit
+        )
+        if (
+            self.speech_frames >= VAD_MIN_SPEECH_FRAMES
+            and (enough_recent_silence or reached_hard_limit)
+        ):
+            await self.start_pipeline()
+
+    async def start_pipeline(self) -> None:
+        if self.pipeline_task is not None or self.speech_frames < VAD_MIN_SPEECH_FRAMES:
+            return
+        pcm = bytes(self.audio)
+        wake_check = self.state == "WAKE_WORD"
+        if wake_check:
+            logger.info(
+                "Wake audio device=%s frames=%d speech_frames=%d peak_rms=%d avg_speech_rms=%d",
+                self.device_id,
+                len(pcm) // PCM_FRAME_BYTES,
+                self.speech_frames,
+                self.max_energy,
+                self.speech_energy_total // max(1, self.speech_frames),
+            )
+        else:
+            logger.info(
+                "Command speech ended device=%s frames=%d speech_frames=%d peak_rms=%d",
+                self.device_id,
+                len(pcm) // PCM_FRAME_BYTES,
+                self.speech_frames,
+                self.max_energy,
+            )
+        if self.activation_timeout_task:
+            self.activation_timeout_task.cancel()
+            self.activation_timeout_task = None
+        self.state = "PROCESSING"
+        self.audio.clear()
+        if not wake_check:
+            await self.send_json({"type": "listen", "state": "processing"})
+        coroutine = self.run_wake_check(pcm) if wake_check else self.run_pipeline(pcm)
+        self.pipeline_task = asyncio.create_task(coroutine, name=f"voice-{self.session_id}")
+        self.pipeline_task.add_done_callback(lambda _: setattr(self, "pipeline_task", None))
+
+    async def abort(self) -> None:
+        task = self.pipeline_task
+        if task and not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        await self.send_json({"type": "tts", "state": "stop"})
+        await self.set_wake_word(notify_board=True)
+
+    async def run_wake_check(self, pcm: bytes) -> None:
+        try:
+            wake_pcm = normalize_wake_pcm(pcm)
+            if settings.STT_PROVIDER == "google-web":
+                vi_result, en_result = await asyncio.gather(
+                    self.transcribe(wake_pcm, language=settings.STT_LANGUAGE),
+                    self.transcribe(wake_pcm, language="en-US"),
+                    return_exceptions=True,
+                )
+                transcripts = [
+                    ("en-US", en_result if isinstance(en_result, str) else ""),
+                    (settings.STT_LANGUAGE, vi_result if isinstance(vi_result, str) else ""),
+                ]
+                errors = [result for result in (vi_result, en_result) if isinstance(result, Exception)]
+                if errors and not any(text for _, text in transcripts):
+                    raise errors[0]
+            else:
+                transcripts = [(settings.STT_LANGUAGE, await self.transcribe(wake_pcm))]
+
+            language, transcript, matched, command = "", "", False, ""
+            for candidate_language, candidate_text in transcripts:
+                candidate_matched, candidate_command = split_wake_word(candidate_text)
+                if candidate_matched:
+                    language = candidate_language
+                    transcript = candidate_text
+                    matched = True
+                    command = candidate_command
+                    break
+            if not matched and len(transcripts) == 2 and matches_device_wake_signature(
+                transcripts[0][1], transcripts[1][1]
+            ):
+                language = "bilingual-signature"
+                transcript = f"{transcripts[0][1]} / {transcripts[1][1]}"
+                matched = True
+                command = ""
+            if not transcript:
+                language, transcript = transcripts[0]
+            if not matched:
+                logger.info(
+                    "Wake phrase rejected device=%s transcripts=%r",
+                    self.device_id, transcripts,
+                )
+                await self.set_wake_word()
+                return
+            logger.info(
+                "Wake phrase accepted device=%s language=%s transcript=%r candidates=%r",
+                self.device_id, language, transcript, transcripts,
+            )
+            if command:
+                await self.send_json({"type": "listen", "state": "processing"})
+                await self.process_transcript(command)
+                await self.set_wake_word(notify_board=True)
+            else:
+                await self.set_listening(notify_board=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("Wake-word check failed device=%s: %s", self.device_id, exc)
+            with contextlib.suppress(Exception):
+                await self.set_wake_word()
+
+    async def run_pipeline(self, pcm: bytes) -> None:
+        try:
+            await self.send_json({"type": "llm", "emotion": "thinking", "text": "Đang nhận diện..."})
+            transcript = await self.transcribe(pcm)
+            if not transcript:
+                logger.info("VAD event contained no recognizable speech device=%s", self.device_id)
+                return
+            await self.process_transcript(transcript)
+        except asyncio.CancelledError:
+            raise
+        finally:
+            with contextlib.suppress(Exception):
+                await self.set_wake_word(notify_board=True)
+
+    async def process_transcript(self, transcript: str) -> None:
+        turn_id = ""
+        try:
+            logger.info("STT device=%s text=%s", self.device_id, transcript)
+            await self.send_json({"type": "stt", "text": transcript})
+            history = await conversation_store.recent_context(self.device_id)
+            turn_id = await conversation_store.create_turn(
+                self.device_id, transcript, "openrouter", settings.OPENROUTER_MODEL
+            )
+            answer = await self.chat(history, transcript, turn_id)
+            await conversation_store.complete_turn(turn_id, answer)
+            await self.send_json({"type": "llm", "emotion": "happy", "text": answer})
+            await self.speak(answer)
+        except Exception as exc:
+            logger.exception("Voice pipeline failed device=%s", self.device_id)
+            message = "Xin lỗi, Dom chưa xử lý được yêu cầu này. Bạn thử lại nhé."
+            if turn_id:
+                await conversation_store.complete_turn(turn_id, message)
+            with contextlib.suppress(Exception):
+                await self.send_json({"type": "llm", "emotion": "sad", "text": message})
+                await self.speak(message)
+            logger.warning("Pipeline reason: %s", exc)
+
+    async def _openrouter(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if not settings.OPENROUTER_API_KEY:
+            raise RuntimeError("OPENROUTER_API_KEY is not configured")
+        headers = {
+            "Authorization": f"Bearer {settings.OPENROUTER_API_KEY}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": settings.OPENROUTER_HTTP_REFERER,
+            "X-Title": "DomOS",
+        }
+        async with httpx.AsyncClient(timeout=settings.OPENROUTER_TIMEOUT_SEC) as client:
+            response = await client.post(
+                f"{settings.OPENROUTER_BASE_URL.rstrip('/')}/chat/completions",
+                headers=headers,
+                json=payload,
+            )
+        if response.is_error:
+            try:
+                error = response.json().get("error") or {}
+                detail = f"{error.get('code', 'unknown')}: {error.get('message', 'request failed')}"
+            except (ValueError, AttributeError):
+                detail = "request failed"
+            raise RuntimeError(f"OpenRouter HTTP {response.status_code}: {detail}")
+        return response.json()
+
+    async def transcribe(self, pcm: bytes, language: str | None = None) -> str:
+        if settings.STT_PROVIDER == "google-web":
+            audio = sr.AudioData(pcm, PCM_SAMPLE_RATE, PCM_SAMPLE_WIDTH)
+            recognizer = sr.Recognizer()
+            try:
+                return _clean_text(await asyncio.to_thread(
+                    recognizer.recognize_google,
+                    audio,
+                    language=language or settings.STT_LANGUAGE,
+                ))
+            except sr.UnknownValueError:
+                return ""
+            except sr.RequestError as exc:
+                raise RuntimeError(f"Google STT unavailable: {exc}") from exc
+        audio = base64.b64encode(pcm_to_wav(pcm)).decode("ascii")
+        response = await self._openrouter({
+            "model": settings.OPENROUTER_AUDIO_MODEL,
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "Chép lại chính xác lời nói trong âm thanh. Ưu tiên tiếng Việt. Chỉ trả về nguyên văn, không giải thích."},
+                {"type": "input_audio", "input_audio": {"data": audio, "format": "wav"}},
+            ]}],
+            "temperature": 0,
+        })
+        choices = response.get("choices") or []
+        return _clean_text(choices[0].get("message", {}).get("content")) if choices else ""
+
+    async def chat(self, history: list[dict[str, str]], transcript: str, turn_id: str) -> str:
+        direct = await self.try_direct_command(transcript, turn_id)
+        if direct:
+            return direct
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": SYSTEM_PROMPT}, *history,
+            {"role": "user", "content": transcript},
+        ]
+        for _ in range(3):
+            response = await self._openrouter({
+                "model": settings.OPENROUTER_MODEL,
+                "messages": messages,
+                "tools": TOOLS,
+                "tool_choice": "auto",
+                "temperature": 0.3,
+            })
+            choices = response.get("choices") or []
+            if not choices:
+                raise RuntimeError("OpenRouter returned no answer")
+            message = choices[0].get("message") or {}
+            calls = message.get("tool_calls") or []
+            if not calls:
+                answer = _clean_text(message.get("content"))
+                if answer:
+                    return answer
+                raise RuntimeError("OpenRouter returned an empty answer")
+            messages.append({
+                "role": "assistant",
+                "content": message.get("content"),
+                "tool_calls": calls,
+            })
+            for call in calls:
+                function = call.get("function") or {}
+                name = str(function.get("name") or "")
+                try:
+                    arguments = json.loads(function.get("arguments") or "{}")
+                    if not isinstance(arguments, dict):
+                        raise ValueError("arguments must be an object")
+                except (json.JSONDecodeError, ValueError) as exc:
+                    arguments = {}
+                    result: Any = {"error": str(exc)}
+                    status = "error"
+                    duration_ms = 0
+                else:
+                    started = time.monotonic()
+                    try:
+                        result = await self.call_device_tool(name, arguments)
+                        status = "error" if result.get("isError") else "success"
+                    except Exception as exc:
+                        result = {"error": str(exc)}
+                        status = "error"
+                    duration_ms = round((time.monotonic() - started) * 1000)
+                await conversation_store.add_tool_trace(
+                    turn_id, name, arguments, result, duration_ms, status
+                )
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": call.get("id"),
+                    "content": json.dumps(result, ensure_ascii=False),
+                })
+        raise RuntimeError("Too many tool-call rounds")
+
+    async def try_direct_command(self, transcript: str, turn_id: str) -> str | None:
+        """Execute unambiguous Vietnamese controls deterministically.
+
+        This is command parsing, not local AI inference. It keeps hardware
+        controls reliable when the free router selects a model with weak tool
+        calling support.
+        """
+        text = transcript.casefold().strip()
+        name = ""
+        arguments: dict[str, Any] = {}
+        success_text = ""
+        number_match = re.search(r"\b(100|[1-9]?\d)\b", text)
+        number = int(number_match.group(1)) if number_match else None
+
+        if "wallpaper" in text or "hình nền" in text:
+            name, arguments, success_text = "app.launch", {"app": "wallpaper"}, "Đã mở ứng dụng hình nền rồi nhé!"
+        elif "clock" in text or "đồng hồ" in text:
+            name, arguments, success_text = "app.launch", {"app": "clock"}, "Đã mở ứng dụng đồng hồ rồi nhé!"
+        elif "độ sáng" in text or "màn hình" in text:
+            if "tăng" in text:
+                delta = number or 10
+            elif "giảm" in text:
+                delta = -(number or 10)
+            else:
+                return None
+            name, arguments = "display.adjust_brightness", {"delta": delta}
+            success_text = f"Độ sáng đã {'tăng' if delta > 0 else 'giảm'} {abs(delta)} rồi nhé!"
+        elif "âm lượng" in text or "loa" in text:
+            if "tăng" in text:
+                delta = number or 10
+                name, arguments = "speaker.adjust_volume", {"delta": delta}
+                success_text = f"Âm lượng đã tăng {delta} rồi nhé!"
+            elif "giảm" in text:
+                delta = -(number or 10)
+                name, arguments = "speaker.adjust_volume", {"delta": delta}
+                success_text = f"Âm lượng đã giảm {abs(delta)} rồi nhé!"
+            elif number is not None:
+                name, arguments = "speaker.set_volume", {"volume": number}
+                success_text = f"Âm lượng đã được đặt ở {number} rồi nhé!"
+            else:
+                return None
+        elif "trạng thái" in text and ("thiết bị" in text or "dom" in text):
+            name, arguments, success_text = "device.get_status", {}, "Thiết bị đang hoạt động bình thường."
+        else:
+            return None
+
+        started = time.monotonic()
+        try:
+            result = await self.call_device_tool(name, arguments)
+            status = "error" if result.get("isError") else "success"
+        except Exception as exc:
+            result = {"error": str(exc), "isError": True}
+            status = "error"
+        duration_ms = round((time.monotonic() - started) * 1000)
+        await conversation_store.add_tool_trace(
+            turn_id, name, arguments, result, duration_ms, status
+        )
+        if status == "error":
+            return "Dom chưa điều khiển được thiết bị. Bạn thử lại nhé."
+        return success_text
+
+    async def call_device_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        request_id = self.next_request_id
+        self.next_request_id += 1
+        future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
+        self.pending_mcp[request_id] = future
+        try:
+            await self.send_json({
+                "type": "mcp",
+                "payload": {
+                    "jsonrpc": "2.0", "id": request_id, "method": "tools/call",
+                    "params": {"name": name, "arguments": arguments},
+                },
+            })
+            return await asyncio.wait_for(future, timeout=5)
+        finally:
+            self.pending_mcp.pop(request_id, None)
+
+    def resolve_mcp(self, payload: dict[str, Any]) -> None:
+        request_id = payload.get("id")
+        future = self.pending_mcp.get(request_id)
+        if future and not future.done():
+            future.set_result(payload.get("result") or {"error": payload.get("error"), "isError": True})
+
+    async def speak(self, text: str) -> None:
+        self.state = "SPEAKING"
+        await self.send_json({"type": "tts", "state": "start"})
+        try:
+            sentences = [part.strip() for part in re.split(r"(?<=[.!?…])\s+|(?<=[。！？])", text) if part.strip()]
+            for sentence in sentences or [text]:
+                await self.send_json({"type": "tts", "state": "sentence_start", "text": sentence})
+                if settings.TTS_PROVIDER == "google":
+                    mp3 = await asyncio.to_thread(_google_synthesize, sentence)
+                else:
+                    try:
+                        mp3 = await asyncio.wait_for(
+                            _edge_synthesize(sentence), timeout=settings.TTS_TIMEOUT_SEC
+                        )
+                    except (asyncio.TimeoutError, OSError, edge_tts.exceptions.NoAudioReceived):
+                        logger.warning("Edge TTS unavailable; using Google TTS fallback")
+                        mp3 = await asyncio.to_thread(_google_synthesize, sentence)
+                pcm = await asyncio.to_thread(_decode_mp3, mp3)
+                for offset in range(0, len(pcm), PCM_FRAME_BYTES):
+                    frame = pcm[offset: offset + PCM_FRAME_BYTES]
+                    if len(frame) < PCM_FRAME_BYTES:
+                        frame += bytes(PCM_FRAME_BYTES - len(frame))
+                    await self.send_bytes(frame)
+                    await asyncio.sleep(PCM_FRAME_MS / 1000)
+        finally:
+            await self.send_json({"type": "tts", "state": "stop"})
+
+
+async def _edge_synthesize(text: str) -> bytes:
+    mp3 = bytearray()
+    async for chunk in edge_tts.Communicate(text, settings.TTS_VOICE).stream():
+        if chunk["type"] == "audio":
+            mp3.extend(chunk["data"])
+    if not mp3:
+        raise edge_tts.exceptions.NoAudioReceived("No audio received")
+    return bytes(mp3)
+
+
+def _google_synthesize(text: str) -> bytes:
+    output = io.BytesIO()
+    gTTS(text=text, lang="vi").write_to_fp(output)
+    return output.getvalue()
+
+
+def _decode_mp3(mp3: bytes) -> bytes:
+    output = bytearray()
+    with av.open(io.BytesIO(mp3), mode="r") as container:
+        resampler = av.AudioResampler(format="s16", layout="mono", rate=PCM_SAMPLE_RATE)
+        for decoded in container.decode(audio=0):
+            frames = resampler.resample(decoded) or []
+            if not isinstance(frames, list):
+                frames = [frames]
+            for frame in frames:
+                output.extend(bytes(frame.planes[0])[: frame.samples * PCM_SAMPLE_WIDTH])
+    return bytes(output)
+
+
+async def handle_openrouter_voice(websocket: WebSocket) -> None:
+    await websocket.accept()
+    authorization = websocket.headers.get("authorization", "")
+    if settings.VOICE_AUTH_TOKEN and authorization != f"Bearer {settings.VOICE_AUTH_TOKEN}":
+        await websocket.close(code=1008, reason="Unauthorized")
+        return
+    device_id = websocket.headers.get("device-id", "ES3C28P")
+    session_id = str(uuid.uuid4())
+    session = VoiceSession(websocket, device_id, session_id)
+    try:
+        raw = await asyncio.wait_for(websocket.receive_text(), timeout=10)
+        hello = json.loads(raw)
+        validate_dom_hello(hello)
+        await voice_registry.add(session_id)
+        await session.send_json({
+            "type": "hello", "provider": "openrouter", "transport": "websocket",
+            "audio_params": {"codec": "pcm", "sample_rate": 16_000, "channels": 1, "frame_duration": 60},
+            "features": {"mcp": True, "vad": True, "emotions": True, "tts_streaming": True},
+        })
+        await session.set_wake_word()
+        logger.info("OpenRouter voice connected device=%s session=%s", device_id, session_id)
+        while True:
+            raw_message = await websocket.receive()
+            if raw_message.get("type") == "websocket.disconnect":
+                break
+            if raw_message.get("bytes") is not None:
+                await session.consume_audio(raw_message["bytes"])
+                continue
+            text = raw_message.get("text")
+            if not text:
+                continue
+            message = json.loads(text)
+            message_type = message.get("type")
+            if message_type == "listen" and message.get("state") == "start":
+                if session.pipeline_task is None:
+                    if message.get("mode") == "wake":
+                        await session.set_wake_word()
+                    else:
+                        await session.set_listening()
+            elif message_type == "listen" and message.get("state") == "stop":
+                await session.start_pipeline()
+            elif message_type == "abort":
+                await session.abort()
+            elif message_type == "mcp" and isinstance(message.get("payload"), dict):
+                session.resolve_mcp(message["payload"])
+    except (WebSocketDisconnect, asyncio.CancelledError):
+        pass
+    except (ValueError, json.JSONDecodeError) as exc:
+        logger.warning("Voice protocol error device=%s: %s", device_id, exc)
+        with contextlib.suppress(RuntimeError):
+            await websocket.close(code=1002, reason=str(exc)[:120])
+    except Exception:
+        logger.exception("Voice session failed device=%s", device_id)
+    finally:
+        if session.pipeline_task and not session.pipeline_task.done():
+            session.pipeline_task.cancel()
+        if session.activation_timeout_task and not session.activation_timeout_task.done():
+            session.activation_timeout_task.cancel()
+        for future in session.pending_mcp.values():
+            if not future.done():
+                future.cancel()
+        await voice_registry.remove(session_id)
+        logger.info("OpenRouter voice disconnected device=%s", device_id)

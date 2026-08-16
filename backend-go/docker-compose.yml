@@ -1,0 +1,58 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: domos
+      POSTGRES_PASSWORD: domos
+      POSTGRES_DB: domos
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U domos"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  mosquitto:
+    image: eclipse-mosquitto:2
+    restart: unless-stopped
+    ports:
+      - "1883:1883"
+      - "9001:9001"
+    volumes:
+      - ./mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - mosquitto_data:/mosquitto/data
+      - mosquitto_log:/mosquitto/log
+
+  backend:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mosquitto:
+        condition: service_started
+    environment:
+      APP_ENV: production
+      APP_PORT: 8081
+      DATABASE_URL: "host=postgres user=domos password=domos dbname=domos port=5432 sslmode=disable TimeZone=UTC"
+      JWT_SECRET: change-me-in-production
+      JWT_EXPIRY_HOURS: "72"
+      MQTT_BROKER: "tcp://mosquitto:1883"
+      MQTT_CLIENT_ID: domos-backend
+      UPLOAD_DIR: /app/uploads
+    ports:
+      - "8081:8081"
+    volumes:
+      - uploads_data:/app/uploads
+
+volumes:
+  postgres_data:
+  mosquitto_data:
+  mosquitto_log:
+  uploads_data:

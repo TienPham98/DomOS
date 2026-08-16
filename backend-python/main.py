@@ -1,0 +1,116 @@
+"""DomOS cloud voice gateway, conversation API and wallpaper proxy."""
+
+from contextlib import asynccontextmanager
+import logging
+from pathlib import Path
+
+import httpx
+from fastapi import FastAPI, HTTPException, WebSocket
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, Response
+
+from config import settings
+from services.openrouter_voice_service import (
+    conversation_store,
+    handle_openrouter_voice,
+    voice_registry,
+)
+
+logging.basicConfig(
+    level=logging.DEBUG if settings.DOMOS_DEBUG else logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger("domos.main")
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    await conversation_store.initialize()
+    yield
+
+
+app = FastAPI(
+    title=settings.APP_NAME,
+    version="0.5.0",
+    description="Dom Voice Protocol v3 with OpenRouter and persistent memory",
+    lifespan=lifespan,
+)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.get("/health")
+async def health_check() -> dict:
+    return {
+        "status": "online",
+        "service": settings.APP_NAME,
+        "version": "0.5.0",
+        "provider": "openrouter",
+        "local_ai": False,
+        "active_sessions": voice_registry.count,
+        "model": settings.OPENROUTER_MODEL,
+        "audio_model": settings.OPENROUTER_AUDIO_MODEL,
+        "stt_provider": settings.STT_PROVIDER,
+        "tts_provider": settings.TTS_PROVIDER,
+        "api_key_configured": bool(settings.OPENROUTER_API_KEY),
+        "memory": "sqlite",
+    }
+
+
+@app.websocket("/api/v1/voice/stream")
+async def voice_stream_websocket(websocket: WebSocket) -> None:
+    await handle_openrouter_voice(websocket)
+
+
+@app.get("/api/v1/conversations")
+async def list_conversations(device_id: str | None = None, limit: int = 50) -> dict:
+    items = await conversation_store.list_turns(device_id=device_id, limit=limit)
+    return {"items": items, "count": len(items)}
+
+
+@app.get("/api/wallpapers/slideshow")
+async def proxy_wallpapers_slideshow() -> JSONResponse:
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                "http://127.0.0.1:8081/api/wallpapers/slideshow", timeout=5.0
+            )
+        data = response.json()
+        wallpapers = data.get("data", {}).get("wallpapers", [])
+        data.get("data", {})["wallpapers"] = [
+            url.replace(":8081", ":8000") for url in wallpapers
+        ]
+        return JSONResponse(content=data, status_code=response.status_code)
+    except (httpx.HTTPError, ValueError) as exc:
+        logger.warning("Wallpaper slideshow proxy failed: %s", exc)
+        return JSONResponse(content={"error": str(exc)}, status_code=502)
+
+
+@app.get("/uploads/wallpapers/{filename}")
+async def proxy_wallpaper_file(filename: str) -> Response:
+    safe_name = Path(filename).name
+    if safe_name != filename:
+        raise HTTPException(status_code=400, detail="Invalid filename")
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"http://127.0.0.1:8081/uploads/wallpapers/{safe_name}", timeout=10.0
+            )
+        return Response(
+            content=response.content,
+            status_code=response.status_code,
+            media_type=response.headers.get("content-type", "image/jpeg"),
+        )
+    except httpx.HTTPError as exc:
+        logger.warning("Wallpaper file proxy failed for %s: %s", safe_name, exc)
+        return Response(status_code=502)
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(app, host=settings.HOST, port=settings.PORT)

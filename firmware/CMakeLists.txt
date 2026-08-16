@@ -1,0 +1,49 @@
+cmake_minimum_required(VERSION 3.16)
+
+# Keep deployment addresses out of tracked firmware files. ESP-IDF receives a
+# generated defaults file from the private repository-root .env at configure
+# time; the generated sdkconfig remains under the ignored build directory.
+set(DOMOS_ENV_FILE "${CMAKE_CURRENT_LIST_DIR}/../.env")
+if(NOT EXISTS "${DOMOS_ENV_FILE}")
+    message(FATAL_ERROR "Missing root .env; copy .env.example and configure deployment addresses")
+endif()
+
+file(STRINGS "${DOMOS_ENV_FILE}" DOMOS_ENV_LINES ENCODING UTF-8)
+foreach(DOMOS_ENV_LINE IN LISTS DOMOS_ENV_LINES)
+    if(DOMOS_ENV_LINE MATCHES "^([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
+        set("DOMOS_ENV_${CMAKE_MATCH_1}" "${CMAKE_MATCH_2}")
+    endif()
+endforeach()
+
+foreach(REQUIRED_KEY DOMOS_HOST_IP ESP32_DEVICE_IP ESP32_GATEWAY_IP ESP32_NETMASK)
+    if(NOT DEFINED DOMOS_ENV_${REQUIRED_KEY} OR DOMOS_ENV_${REQUIRED_KEY} STREQUAL "")
+        message(FATAL_ERROR "${REQUIRED_KEY} must be set in the root .env")
+    endif()
+endforeach()
+
+if(DEFINED DOMOS_ENV_DOMOS_MQTT_URI AND NOT DOMOS_ENV_DOMOS_MQTT_URI STREQUAL "")
+    set(DOMOS_MQTT_URI "${DOMOS_ENV_DOMOS_MQTT_URI}")
+else()
+    set(DOMOS_MQTT_URI "mqtt://${DOMOS_ENV_DOMOS_HOST_IP}:1883")
+endif()
+if(DEFINED DOMOS_ENV_DOMOS_AI_WS_URI AND NOT DOMOS_ENV_DOMOS_AI_WS_URI STREQUAL "")
+    set(DOMOS_AI_WS_URI "${DOMOS_ENV_DOMOS_AI_WS_URI}")
+else()
+    set(DOMOS_AI_WS_URI "ws://${DOMOS_ENV_DOMOS_HOST_IP}:8000/api/v1/voice/stream")
+endif()
+
+set(DOMOS_PRIVATE_DEFAULTS "${CMAKE_BINARY_DIR}/sdkconfig.private.defaults")
+file(WRITE "${DOMOS_PRIVATE_DEFAULTS}"
+    "CONFIG_DOMOS_MQTT_URI=\"${DOMOS_MQTT_URI}\"\n"
+    "CONFIG_DOMOS_DASHBOARD_URL=\"http://${DOMOS_ENV_DOMOS_HOST_IP}:3000\"\n"
+    "CONFIG_DOMOS_AI_HTTP_BASE=\"http://${DOMOS_ENV_DOMOS_HOST_IP}:8000\"\n"
+    "CONFIG_DOMOS_DEVICE_IP=\"${DOMOS_ENV_ESP32_DEVICE_IP}\"\n"
+    "CONFIG_DOMOS_GATEWAY_IP=\"${DOMOS_ENV_ESP32_GATEWAY_IP}\"\n"
+    "CONFIG_DOMOS_NETMASK=\"${DOMOS_ENV_ESP32_NETMASK}\"\n"
+    "CONFIG_DOMOS_AI_WS_URI=\"${DOMOS_AI_WS_URI}\"\n")
+
+set(SDKCONFIG "${CMAKE_BINARY_DIR}/sdkconfig")
+set(SDKCONFIG_DEFAULTS "${CMAKE_CURRENT_LIST_DIR}/sdkconfig.defaults;${DOMOS_PRIVATE_DEFAULTS}")
+
+include($ENV{IDF_PATH}/tools/cmake/project.cmake)
+project(domos_firmware)

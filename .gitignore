@@ -1,0 +1,31 @@
+/.vscode
+/README.txt
+
+# Environment & Secret files
+.env
+.env.local
+.env.development
+.env.production
+*.env
+*.env.local
+
+# Build & Local Databases
+*.db
+server.exe
+node_modules/
+dist/
+build/
+firmware/build/
+firmware/sdkconfig
+**/build/
+.venv/
+__pycache__/
+*.py[cod]
+*.ninja*
+
+# Runtime data, downloaded dependencies, and generated user content
+.runtime-logs/
+.runtime-research/
+backend-go/uploads/
+backend-go/server.exe~
+firmware/managed_components/

@@ -1,0 +1,71 @@
+menu "DomOS"
+
+config DOMOS_WIFI_SSID
+    string "Wi-Fi SSID"
+    default "Dom_12"
+    help
+        Wi-Fi network name. Set this with idf.py menuconfig before flashing.
+
+config DOMOS_WIFI_PASSWORD
+    string "Wi-Fi password"
+    default ""
+    help
+        WPA2 password. This value is compiled into the development firmware.
+
+config DOMOS_WIFI_MAX_RETRY
+    int "Wi-Fi reconnect attempts"
+    default 10
+    range 1 100
+
+config DOMOS_MQTT_URI
+    string "MQTT broker URI"
+    default ""
+    help
+        Set from the private root .env before building.
+
+config DOMOS_DASHBOARD_URL
+    string "DomOS Dashboard URL"
+    default ""
+    help
+        Dashboard URL shown by the device. Set from .env.
+
+config DOMOS_AI_HTTP_BASE
+    string "AI Gateway HTTP base URL"
+    default ""
+    help
+        HTTP base URL used for non-WebSocket Gateway requests. Set from .env.
+
+config DOMOS_DEVICE_IP
+    string "ESP32 static IPv4 address"
+    default ""
+    help
+        Static device address. Set from the private root .env.
+
+config DOMOS_GATEWAY_IP
+    string "ESP32 IPv4 gateway"
+    default ""
+
+config DOMOS_NETMASK
+    string "ESP32 IPv4 network mask"
+    default ""
+
+config DOMOS_OTA_FIRMWARE_URL
+    string "HTTPS firmware URL"
+    default ""
+    help
+        Complete HTTPS URL for the signed firmware image. OTA stays disabled when empty.
+
+config DOMOS_AI_WS_URI
+    string "AI Gateway WebSocket URI"
+    default ""
+    help
+        WebSocket URI of the Python AI Gateway. Set from .env.
+
+config DOMOS_AI_AUTH_TOKEN
+    string "AI Gateway Bearer token"
+    default ""
+    help
+        Optional Bearer token for authenticating the device to the AI Gateway.
+        Leave empty if authentication is not configured.
+
+endmenu
